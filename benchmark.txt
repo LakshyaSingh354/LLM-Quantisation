@@ -7,3 +7,6 @@ Throughput: 375.97 tokens/sec (bs=4, seq=128)
 
 ------------------------------------------------------
 
+Quantized Perplexity (GPT-2 Large): 21.62
+Throughput: 1392.99 tokens/sec (bs=4, seq=128)
+

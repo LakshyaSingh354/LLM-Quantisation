@@ -19,10 +19,27 @@ model = GPT2LMHeadModel.from_pretrained("gpt2-large")
 # replace first linear layer in the MLP
 for name, module in model.named_modules():
     if isinstance(module, nn.Linear):
-        setattr(model, name,
-            QuantLinear(module.in_features, module.out_features, bias=module.bias is not None)
+        new_module = QuantLinear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            original_weight=module.weight.data,
+            original_bias=module.bias.data if module.bias is not None else None
         )
-        break
+        
+        # ✅ FIX: Handle layers that are direct children of the model
+        if '.' in name:
+            parent_name, child_name = name.rsplit('.', 1)
+            parent_module = model.get_submodule(parent_name)
+        else:
+            # The parent is the model itself
+            parent_module = model
+            child_name = name
+            
+        setattr(parent_module, child_name, new_module)
+        print(f"Replaced {name} with QuantLinear")
+        break # Keep this to only replace the first layer
+
 model.cuda().eval()
 
 # --------------------
@@ -51,10 +68,10 @@ for i in tqdm(range(0, input_ids.size(1), stride)):
     nlls.append(neg_log_likelihood)
 
 ppl = torch.exp(torch.stack(nlls).sum() / end_loc)
-print(f"Baseline Perplexity (GPT-2 Large): {ppl.item():.2f}")
+print(f"Quantized Perplexity (GPT-2 Large): {ppl.item():.2f}")
 
 
-batch_size = 4
+batch_size = 8
 seq_len = 128
 inputs = torch.randint(0, model.config.vocab_size, (batch_size, seq_len)).to(device)
 
