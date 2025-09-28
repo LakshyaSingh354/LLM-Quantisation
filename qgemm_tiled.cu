@@ -106,20 +106,108 @@ __global__ void quantize_activations_colwise(const float* __restrict__ X, uint8_
     }
 }
 
-__global__ void qgemm_kernel(const int8_t* __restrict__ Wq, const float* __restrict__ Sw,
-                            const uint8_t* __restrict__ Xq, const float* __restrict__ Sx,
-                            const int* __restrict__ Zx, float* Y, int M, int K, int N) {
-    int m = blockIdx.y * blockDim.y + threadIdx.y;
-    int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m < M && n < N) {
-        int32_t acc = 0;
-        for (int k = 0; k < K; k++) {
-            int32_t w = static_cast<int32_t>(Wq[m * K + k]);
-            int32_t x = static_cast<int32_t>(Xq[k * N + n]) - Zx[n];
-            acc += w * x;
+__global__ void qgemm_kernel(const int8_t* __restrict__ Wq,
+                                                 const float* __restrict__ Sw,
+                                                 const uint8_t* __restrict__ Xq,
+                                                 const float* __restrict__ Sx,
+                                                 const int* __restrict__ Zx,
+                                                 float* Y, int M, int K, int N) {
+    extern __shared__ int8_t smem_raw[]; // optional if dynamic shared needed
+    // static shared arrays (compile-time sizes) - preferred
+    __shared__ int8_t  Wq_tile[TILE_SIZE][TILE_SIZE];
+    __shared__ int32_t Xq_tile[TILE_SIZE][TILE_SIZE];
+
+    const int bx = blockIdx.x, by = blockIdx.y;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+
+    const int base_row = by * TILE_SIZE;
+    const int base_col = bx * TILE_SIZE;
+
+    // thread-owned offset within the tile
+    const int thread_row_in_tile = ty * REG_TILE_M; // 0..TILE_SIZE-REG_TILE_M
+    const int thread_col_in_tile = tx * REG_TILE_N; // 0..TILE_SIZE-REG_TILE_N
+
+    const int global_row = base_row + thread_row_in_tile;
+    const int global_col = base_col + thread_col_in_tile;
+
+    int32_t acc[REG_TILE_M][REG_TILE_N];
+    #pragma unroll
+    for (int i = 0; i < REG_TILE_M; ++i)
+        #pragma unroll
+        for (int j = 0; j < REG_TILE_N; ++j)
+            acc[i][j] = 0;
+
+    int8_t w_reg[REG_TILE_M];
+
+    const int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (int t = 0; t < numTiles; ++t) {
+        // how many K values are valid in this tile
+        const int K_tile_valid = min(TILE_SIZE, K - t * TILE_SIZE);
+
+        // Cooperative load: each thread writes REG_TILE_M x REG_TILE_N entries
+        #pragma unroll
+        for (int lm = 0; lm < REG_TILE_M; ++lm) {
+            #pragma unroll
+            for (int ln = 0; ln < REG_TILE_N; ++ln) {
+                int tile_r = thread_row_in_tile + lm;   // 0..TILE_SIZE-1
+                int tile_c = thread_col_in_tile + ln;   // 0..TILE_SIZE-1
+
+                int Wq_row = base_row + tile_r;         // global m
+                int Wq_col = t * TILE_SIZE + tile_c;    // global k
+
+                if (Wq_row < M && Wq_col < K) {
+                    Wq_tile[tile_r][tile_c] = Wq[Wq_row * K + Wq_col];
+                } else {
+                    // MUST zero any shared cell that could be read later
+                    Wq_tile[tile_r][tile_c] = 0;
+                }
+
+                int Xq_row = t * TILE_SIZE + tile_r;    // global k
+                int Xq_col = base_col + tile_c;         // global n
+                if (Xq_row < K && Xq_col < N) {
+                    int32_t xval = static_cast<int32_t>(Xq[Xq_row * N + Xq_col]);
+                    Xq_tile[tile_r][tile_c] = xval - Zx[Xq_col];
+                } else {
+                    Xq_tile[tile_r][tile_c] = 0;
+                }
+            }
         }
-        float result = acc * (Sw[m] * Sx[n]);
-        Y[m * N + n] = result;
+
+        __syncthreads();
+
+        // Compute only up to K_tile_valid k-steps; but we still iterate TILE_SIZE,
+        // reading shared entries — they were zeroed above for invalid K positions.
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            // If k >= K_tile_valid then Xq_tile[k][*] and Wq_tile[*][k] are zeros by construction.
+            #pragma unroll
+            for (int i = 0; i < REG_TILE_M; ++i) {
+                w_reg[i] = Wq_tile[thread_row_in_tile + i][k];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < REG_TILE_M; ++i) {
+                #pragma unroll
+                for (int j = 0; j < REG_TILE_N; ++j) {
+                    acc[i][j] += static_cast<int32_t>(w_reg[i]) * Xq_tile[k][thread_col_in_tile + j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write back with scaling
+    #pragma unroll
+    for (int i = 0; i < REG_TILE_M; ++i) {
+        #pragma unroll
+        for (int j = 0; j < REG_TILE_N; ++j) {
+            int out_r = global_row + i;
+            int out_c = global_col + j;
+            if (out_r < M && out_c < N) {
+                Y[out_r * N + out_c] = static_cast<float>(acc[i][j]) * Sw[out_r] * Sx[out_c];
+            }
+        }
     }
 }
 
@@ -267,9 +355,18 @@ torch::Tensor qgemm_wrapper(torch::Tensor Wq, torch::Tensor Sw, torch::Tensor Xq
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(Wq.device());
     torch::Tensor Y = torch::zeros({M, N}, options);
 
-    // Use simple 2D grid launch instead of register tiling for now
-    dim3 block(16, 16);  // 256 threads per block
-    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    // Use register-tiled kernel configuration
+    // Each thread block handles TILE_SIZE x TILE_SIZE elements
+    // Each thread handles REG_TILE_M x REG_TILE_N elements
+    const int threads_per_block_x = TILE_SIZE / REG_TILE_N;  // 32/4 = 8
+    const int threads_per_block_y = TILE_SIZE / REG_TILE_M;  // 32/4 = 8
+    
+    dim3 block(threads_per_block_x, threads_per_block_y);  // 8x8 = 64 threads per block
+    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+
+    // Calculate shared memory size needed for the tiles
+    size_t shared_mem_size = TILE_SIZE * TILE_SIZE * sizeof(int8_t) +  // Wq_tile
+                            TILE_SIZE * TILE_SIZE * sizeof(int32_t);   // Xq_tile
 
     // pointers
     const int8_t* Wq_ptr = reinterpret_cast<const int8_t*>(Wq.data_ptr<int8_t>());
@@ -280,7 +377,7 @@ torch::Tensor qgemm_wrapper(torch::Tensor Wq, torch::Tensor Sw, torch::Tensor Xq
     float* Y_ptr = Y.data_ptr<float>();
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    qgemm_kernel<<<grid, block, 0, stream>>>(Wq_ptr, Sw_ptr, Xq_ptr, Sx_ptr, Zx_ptr, Y_ptr, M, K, N);
+    qgemm_kernel<<<grid, block, shared_mem_size, stream>>>(Wq_ptr, Sw_ptr, Xq_ptr, Sx_ptr, Zx_ptr, Y_ptr, M, K, N);
     AT_CUDA_CHECK(cudaGetLastError());
     return Y;
 }

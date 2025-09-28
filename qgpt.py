@@ -15,6 +15,7 @@ device = "cuda"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 model = GPT2LMHeadModel.from_pretrained(model_name)
+model.cuda()
 
 # replace first linear layer in the MLP
 for name, module in model.named_modules():
@@ -27,20 +28,18 @@ for name, module in model.named_modules():
             original_bias=module.bias.data if module.bias is not None else None
         )
         
-        # ✅ FIX: Handle layers that are direct children of the model
         if '.' in name:
             parent_name, child_name = name.rsplit('.', 1)
             parent_module = model.get_submodule(parent_name)
         else:
-            # The parent is the model itself
             parent_module = model
             child_name = name
             
         setattr(parent_module, child_name, new_module)
         print(f"Replaced {name} with QuantLinear")
-        break # Keep this to only replace the first layer
+        # break # Keep this to only replace the first layer
 
-model.cuda().eval()
+model.eval()
 
 initial_mem = torch.cuda.memory_allocated() / 1024**3 # Convert bytes to GB
 print(f"Initial model memory usage: {initial_mem:.2f} GB")
