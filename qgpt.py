@@ -4,6 +4,7 @@ from transformers import AutoTokenizer, GPT2LMHeadModel
 from datasets import load_dataset
 import math, time
 from qlinear import QuantLinear
+from transformers.pytorch_utils import Conv1D
 
 from tqdm import tqdm
 # --------------------
@@ -17,17 +18,43 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = GPT2LMHeadModel.from_pretrained(model_name)
 model.cuda()
 
-# replace first linear layer in the MLP
+layers_to_replace = []
 for name, module in model.named_modules():
-    if isinstance(module, nn.Linear):
+    # ✅ Check for both nn.Linear and the special Conv1D class
+    if isinstance(module, (nn.Linear, Conv1D)):
+        layers_to_replace.append(name)
+
+print(f"Found {len(layers_to_replace)} linear layers to replace.")
+
+# --- Step 2: Iterate over the collected names and replace them ---
+for name in layers_to_replace[:3]:
+    original_module = model.get_submodule(name)
+    in_features = None
+    # Handle attribute differences between nn.Linear and Conv1D
+    if isinstance(original_module, nn.Linear):
+        in_features = original_module.in_features
+        out_features = original_module.out_features
+        original_weight = original_module.weight.data
+        original_bias = original_module.bias.data if original_module.bias is not None else None
+        
+    elif isinstance(original_module, Conv1D):
+        # The Conv1D weight is stored transposed, so we need to adapt
+        in_features = original_module.weight.shape[0]
+        out_features = original_module.weight.shape[1]
+        original_weight = original_module.weight.data.t() # ⚠️ Transpose the weight!
+        original_bias = original_module.bias.data if original_module.bias is not None else None
+
+    if in_features:
+        # Create your new quantized module
         new_module = QuantLinear(
-            module.in_features,
-            module.out_features,
-            bias=module.bias is not None,
-            original_weight=module.weight.data,
-            original_bias=module.bias.data if module.bias is not None else None
+            in_features,
+            out_features,
+            bias=(original_bias is not None),
+            original_weight=original_weight,
+            original_bias=original_bias
         )
         
+        # Get the parent module to set the new child
         if '.' in name:
             parent_name, child_name = name.rsplit('.', 1)
             parent_module = model.get_submodule(parent_name)
@@ -37,7 +64,8 @@ for name, module in model.named_modules():
             
         setattr(parent_module, child_name, new_module)
         print(f"Replaced {name} with QuantLinear")
-        # break # Keep this to only replace the first layer
+    # break
+
 
 model.eval()
 
