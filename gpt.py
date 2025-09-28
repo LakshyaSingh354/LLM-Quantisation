@@ -1,9 +1,7 @@
 import torch
-import torch.nn as nn
-from transformers import AutoTokenizer, GPT2LMHeadModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 import math, time
-from qlinear import QuantLinear
 
 from tqdm import tqdm
 # --------------------
@@ -13,34 +11,10 @@ model_name = "gpt2-large"
 device = "cuda"
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-model = GPT2LMHeadModel.from_pretrained(model_name)
-
-# replace first linear layer in the MLP
-for name, module in model.named_modules():
-    if isinstance(module, nn.Linear):
-        new_module = QuantLinear(
-            module.in_features,
-            module.out_features,
-            bias=module.bias is not None,
-            original_weight=module.weight.data,
-            original_bias=module.bias.data if module.bias is not None else None
-        )
-        
-        # ✅ FIX: Handle layers that are direct children of the model
-        if '.' in name:
-            parent_name, child_name = name.rsplit('.', 1)
-            parent_module = model.get_submodule(parent_name)
-        else:
-            # The parent is the model itself
-            parent_module = model
-            child_name = name
-            
-        setattr(parent_module, child_name, new_module)
-        print(f"Replaced {name} with QuantLinear")
-        break # Keep this to only replace the first layer
-
-model.cuda().eval()
+model = AutoModelForCausalLM.from_pretrained(
+    model_name
+).cuda()
+model.eval()
 
 initial_mem = torch.cuda.memory_allocated() / 1024**3 # Convert bytes to GB
 print(f"Initial model memory usage: {initial_mem:.2f} GB")
@@ -71,7 +45,7 @@ for i in tqdm(range(0, input_ids.size(1), stride)):
     nlls.append(neg_log_likelihood)
 
 ppl = torch.exp(torch.stack(nlls).sum() / end_loc)
-print(f"Quantized Perplexity (GPT-2 Large): {ppl.item():.2f}")
+print(f"Baseline Perplexity (GPT-2 Large): {ppl.item():.2f}")
 
 
 batch_size = 4

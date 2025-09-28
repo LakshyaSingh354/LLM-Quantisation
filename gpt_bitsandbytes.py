@@ -13,9 +13,13 @@ device = "cuda"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
+    load_in_8bit=True,
     dtype=torch.float16,
-).cuda()
+)
 model.eval()
+
+initial_mem = torch.cuda.memory_allocated() / 1024**3 # Convert bytes to GB
+print(f"Initial model memory usage: {initial_mem:.2f} GB")
 
 # --------------------
 # Load WikiText-2 test split
@@ -67,3 +71,6 @@ end = time.time()
 tokens_processed = batch_size * seq_len * iters
 throughput = tokens_processed / (end - start)
 print(f"Throughput: {throughput:.2f} tokens/sec (bs={batch_size}, seq={seq_len})")
+
+peak_mem = torch.cuda.max_memory_allocated() / 1024**3 # Convert bytes to GB
+print(f"Peak GPU memory usage during run: {peak_mem:.2f} GB")

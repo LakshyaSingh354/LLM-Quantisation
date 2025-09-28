@@ -8,15 +8,12 @@ def get_cuda_arch_flags():
     if not torch.cuda.is_available():
         return ['-gencode', 'arch=compute_50,code=sm_50']  # fallback
     
-    # Get the compute capability of the current GPU
     device = torch.cuda.current_device()
     capability = torch.cuda.get_device_capability(device)
     major, minor = capability
     
-    # Generate architecture flags for the detected GPU and some common ones
     arch_flags = [
         f'-gencode', f'arch=compute_{major}{minor},code=sm_{major}{minor}',
-        # Also include some common architectures for compatibility
         '-gencode', 'arch=compute_50,code=sm_50',
         '-gencode', 'arch=compute_60,code=sm_60',
         '-gencode', 'arch=compute_70,code=sm_70',
@@ -35,7 +32,7 @@ setup(
         CUDAExtension(
             name='qgemm_cuda',
             sources=[
-                'qgemm.cu',
+                'qgemm_tiled.cu',
             ],
             extra_compile_args={
                 'cxx': ['-O3', '-std=c++17'],
