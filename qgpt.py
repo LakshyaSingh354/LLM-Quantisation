@@ -26,8 +26,11 @@ for name, module in model.named_modules():
 
 print(f"Found {len(layers_to_replace)} linear layers to replace.")
 
+print("Loading calibration ranges from 'calibration_ranges.pt'...")
+calibration_ranges = torch.load("calibration_ranges.pt")
+
 # --- Step 2: Iterate over the collected names and replace them ---
-for name in layers_to_replace[:3]:
+for name in layers_to_replace[:2]:
     original_module = model.get_submodule(name)
     in_features = None
     # Handle attribute differences between nn.Linear and Conv1D
@@ -41,29 +44,32 @@ for name in layers_to_replace[:3]:
         # The Conv1D weight is stored transposed, so we need to adapt
         in_features = original_module.weight.shape[0]
         out_features = original_module.weight.shape[1]
-        original_weight = original_module.weight.data.t() # ⚠️ Transpose the weight!
+        original_weight = original_module.weight.data.t()
         original_bias = original_module.bias.data if original_module.bias is not None else None
 
-    if in_features:
-        # Create your new quantized module
-        new_module = QuantLinear(
-            in_features,
-            out_features,
-            bias=(original_bias is not None),
-            original_weight=original_weight,
-            original_bias=original_bias
-        )
+    layer_calib_range = calibration_ranges[name]
+
+    # Create your new quantized module
+    new_module = QuantLinear(
+        in_features,
+        out_features,
+        bias=(original_bias is not None),
+        original_weight=original_weight,
+        original_bias=original_bias,
+        calib_min_t=layer_calib_range['min'].to(device),
+        calib_max_t=layer_calib_range['max'].to(device)
+    )
         
         # Get the parent module to set the new child
-        if '.' in name:
-            parent_name, child_name = name.rsplit('.', 1)
-            parent_module = model.get_submodule(parent_name)
-        else:
-            parent_module = model
-            child_name = name
-            
-        setattr(parent_module, child_name, new_module)
-        print(f"Replaced {name} with QuantLinear")
+    if '.' in name:
+        parent_name, child_name = name.rsplit('.', 1)
+        parent_module = model.get_submodule(parent_name)
+    else:
+        parent_module = model
+        child_name = name
+        
+    setattr(parent_module, child_name, new_module)
+    print(f"Replaced {name} with QuantLinear")
     # break
 
 

@@ -32,7 +32,7 @@ setup(
         CUDAExtension(
             name='qgemm_cuda',
             sources=[
-                'qgemm_tiled.cu',
+                'qgemm_calibrated.cu',
             ],
             extra_compile_args={
                 'cxx': ['-O3', '-std=c++17'],
