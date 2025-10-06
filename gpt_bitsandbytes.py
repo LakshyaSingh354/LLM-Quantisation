@@ -18,7 +18,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.eval()
 
-initial_mem = torch.cuda.memory_allocated() / 1024**3 # Convert bytes to GB
+initial_mem = torch.cuda.memory_allocated() / 1024**3
 print(f"Initial model memory usage: {initial_mem:.2f} GB")
 
 # --------------------
@@ -50,16 +50,19 @@ ppl = torch.exp(torch.stack(nlls).sum() / end_loc)
 print(f"Baseline Perplexity (GPT-2 Large): {ppl.item():.2f}")
 
 
-batch_size = 4
-seq_len = 128
+batch_size = 8
+seq_len = 256
 inputs = torch.randint(0, model.config.vocab_size, (batch_size, seq_len)).to(device)
 
 # Warmup
+warmup_iters = 5
 with torch.no_grad():
-    _ = model(inputs)
+    for _ in range(warmup_iters):
+        _ = model(inputs)
+
 
 # Timed run
-iters = 20
+iters = 50
 torch.cuda.synchronize()
 start = time.time()
 with torch.no_grad():
@@ -72,5 +75,5 @@ tokens_processed = batch_size * seq_len * iters
 throughput = tokens_processed / (end - start)
 print(f"Throughput: {throughput:.2f} tokens/sec (bs={batch_size}, seq={seq_len})")
 
-peak_mem = torch.cuda.max_memory_allocated() / 1024**3 # Convert bytes to GB
+peak_mem = torch.cuda.max_memory_allocated() / 1024**3
 print(f"Peak GPU memory usage during run: {peak_mem:.2f} GB")

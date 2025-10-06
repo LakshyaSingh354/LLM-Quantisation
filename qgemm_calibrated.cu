@@ -9,9 +9,10 @@
 #include <assert.h>
 
 // ------------------- Constants -------------------
-#define TILE_SIZE 32
-#define REG_TILE_N 4
-#define REG_TILE_M 4
+// Increased for better performance
+#define TILE_SIZE 64  // Increased from 32 for better memory reuse
+#define REG_TILE_N 8  // Increased from 4 for better register utilization
+#define REG_TILE_M 8  // Increased from 4 for better register utilization
 
 // ------------------- User kernels (mostly as provided) -------------------
 
@@ -132,7 +133,7 @@ __global__ void qgemm_kernel(const int8_t* __restrict__ Wq,
                                                  const float* __restrict__ Sx,
                                                  const int* __restrict__ Zx,
                                                  float* Y, int M, int K, int N) {
-    extern __shared__ int8_t smem_raw[]; // optional if dynamic shared needed
+    // Increased tile size for better memory reuse
     // static shared arrays (compile-time sizes) - preferred
     __shared__ int8_t  Wq_tile[TILE_SIZE][TILE_SIZE];
     __shared__ int32_t Xq_tile[TILE_SIZE][TILE_SIZE];
@@ -143,9 +144,9 @@ __global__ void qgemm_kernel(const int8_t* __restrict__ Wq,
     const int base_row = by * TILE_SIZE;
     const int base_col = bx * TILE_SIZE;
 
-    // thread-owned offset within the tile
-    const int thread_row_in_tile = ty * REG_TILE_M; // 0..TILE_SIZE-REG_TILE_M
-    const int thread_col_in_tile = tx * REG_TILE_N; // 0..TILE_SIZE-REG_TILE_N
+    // Increased register tile sizes for better compute utilization
+    const int thread_row_in_tile = ty * REG_TILE_M;
+    const int thread_col_in_tile = tx * REG_TILE_N;
 
     const int global_row = base_row + thread_row_in_tile;
     const int global_col = base_col + thread_col_in_tile;
@@ -157,52 +158,74 @@ __global__ void qgemm_kernel(const int8_t* __restrict__ Wq,
         for (int j = 0; j < REG_TILE_N; ++j)
             acc[i][j] = 0;
 
+    // Pre-load weight scales for better memory access pattern
+    float sw_reg[REG_TILE_M];
+    #pragma unroll
+    for (int i = 0; i < REG_TILE_M; ++i) {
+        int row = global_row + i;
+        if (row < M) {
+            sw_reg[i] = Sw[row];
+        }
+    }
+
     int8_t w_reg[REG_TILE_M];
 
     const int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
 
     for (int t = 0; t < numTiles; ++t) {
-        // how many K values are valid in this tile
-        const int K_tile_valid = min(TILE_SIZE, K - t * TILE_SIZE);
-
-        // Cooperative load: each thread writes REG_TILE_M x REG_TILE_N entries
+        // Optimized memory loading with better coalescing
         #pragma unroll
         for (int lm = 0; lm < REG_TILE_M; ++lm) {
-            #pragma unroll
-            for (int ln = 0; ln < REG_TILE_N; ++ln) {
-                int tile_r = thread_row_in_tile + lm;   // 0..TILE_SIZE-1
-                int tile_c = thread_col_in_tile + ln;   // 0..TILE_SIZE-1
+            int tile_r = thread_row_in_tile + lm;
+            int Wq_row = base_row + tile_r;
 
-                int Wq_row = base_row + tile_r;         // global m
-                int Wq_col = t * TILE_SIZE + tile_c;    // global k
-
-                if (Wq_row < M && Wq_col < K) {
-                    Wq_tile[tile_r][tile_c] = Wq[Wq_row * K + Wq_col];
-                } else {
-                    // MUST zero any shared cell that could be read later
-                    Wq_tile[tile_r][tile_c] = 0;
+            // Load weights with stride for better coalescing
+            if (Wq_row < M && (t * TILE_SIZE + tx * REG_TILE_N) < K) {
+                #pragma unroll
+                for (int ln = 0; ln < REG_TILE_N; ++ln) {
+                    int tile_c = tx * REG_TILE_N + ln;
+                    int Wq_col = t * TILE_SIZE + tile_c;
+                    if (Wq_col < K) {
+                        Wq_tile[tile_r][tile_c] = Wq[Wq_row * K + Wq_col];
+                    } else {
+                        Wq_tile[tile_r][tile_c] = 0;
+                    }
                 }
+            }
+        }
 
-                int Xq_row = t * TILE_SIZE + tile_r;    // global k
-                int Xq_col = base_col + tile_c;         // global n
-                if (Xq_row < K && Xq_col < N) {
-                    int32_t xval = static_cast<int32_t>(Xq[Xq_row * N + Xq_col]);
-                    Xq_tile[tile_r][tile_c] = xval - Zx[Xq_col];
-                } else {
-                    Xq_tile[tile_r][tile_c] = 0;
+        // Load Xq tile
+        #pragma unroll
+        for (int lm = 0; lm < REG_TILE_M; ++lm) {
+            int tile_r = thread_row_in_tile + lm;
+            int Xq_row = t * TILE_SIZE + tile_r;
+
+            if (Xq_row < K && base_col + tx * REG_TILE_N < N) {
+                #pragma unroll
+                for (int ln = 0; ln < REG_TILE_N; ++ln) {
+                    int tile_c = tx * REG_TILE_N + ln;
+                    int Xq_col = base_col + tile_c;
+                    if (Xq_col < N) {
+                        int32_t xval = static_cast<int32_t>(Xq[Xq_row * N + Xq_col]);
+                        Xq_tile[tile_r][tile_c] = xval - Zx[Xq_col];
+                    } else {
+                        Xq_tile[tile_r][tile_c] = 0;
+                    }
                 }
             }
         }
 
         __syncthreads();
 
-
+        // Optimized compute loop with better register reuse
         for (int k = 0; k < TILE_SIZE; ++k) {
+            // Load weights into registers
             #pragma unroll
             for (int i = 0; i < REG_TILE_M; ++i) {
                 w_reg[i] = Wq_tile[thread_row_in_tile + i][k];
             }
 
+            // Vectorized computation
             #pragma unroll
             for (int i = 0; i < REG_TILE_M; ++i) {
                 #pragma unroll
@@ -215,15 +238,18 @@ __global__ void qgemm_kernel(const int8_t* __restrict__ Wq,
         __syncthreads();
     }
 
-    // Write back with scaling
+    // Optimized write-back with vectorized stores
     #pragma unroll
     for (int i = 0; i < REG_TILE_M; ++i) {
-        #pragma unroll
-        for (int j = 0; j < REG_TILE_N; ++j) {
-            int out_r = global_row + i;
-            int out_c = global_col + j;
-            if (out_r < M && out_c < N) {
-                Y[out_r * N + out_c] = static_cast<float>(acc[i][j]) * Sw[out_r] * Sx[out_c];
+        int out_r = global_row + i;
+        if (out_r < M) {
+            float scale_row = sw_reg[i];
+            #pragma unroll
+            for (int j = 0; j < REG_TILE_N; ++j) {
+                int out_c = global_col + j;
+                if (out_c < N) {
+                    Y[out_r * N + out_c] = static_cast<float>(acc[i][j]) * scale_row * Sx[out_c];
+                }
             }
         }
     }
@@ -394,9 +420,9 @@ torch::Tensor qgemm_wrapper(torch::Tensor Wq, torch::Tensor Sw, torch::Tensor Xq
     torch::Tensor Y = torch::zeros({M, N}, options);
 
 
-    const int threads_per_block_x = TILE_SIZE / REG_TILE_N;  // 32/4 = 8
-    const int threads_per_block_y = TILE_SIZE / REG_TILE_M;  // 32/4 = 8
-    
+    const int threads_per_block_x = TILE_SIZE / REG_TILE_N;  // 64/8 = 8
+    const int threads_per_block_y = TILE_SIZE / REG_TILE_M;  // 64/8 = 8
+
     dim3 block(threads_per_block_x, threads_per_block_y);  // 8x8 = 64 threads per block
     dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
 
