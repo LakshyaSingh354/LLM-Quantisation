@@ -76,34 +76,31 @@ __global__ void colwise_minmax(const float* __restrict__ A, float* colMins, floa
 __global__ void quantize_weights_rowwise(const float* __restrict__ A, int8_t* Aq,
                                         const float* __restrict__ rowScales, int M, int K) {
     int m = blockIdx.x;
-    int k = threadIdx.x;
-    if (m < M && k < K) {
+    if (m < M) {
         float scale = rowScales[m];
-        float val = A[m * K + k] / scale;
-        val = fmaxf(fminf(val, 127.f), -127.f);
-        Aq[m * K + k] = static_cast<int8_t>(rintf(val));
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            float val = A[m * K + k] / scale;
+            val = fmaxf(fminf(val, 127.f), -127.f);
+            Aq[m * K + k] = static_cast<int8_t>(rintf(val));
+        }
     }
 }
 
 __global__ void quantize_activations_colwise(
     const float* __restrict__ X, uint8_t* Xq,
-    const float* __restrict__ calib_mins,  // MODIFIED: Pass in pre-calculated mins
-    const float* __restrict__ calib_maxs,  // MODIFIED: Pass in pre-calculated maxs
+    const float* __restrict__ calib_mins,  // Pass in pre-calculated mins
+    const float* __restrict__ calib_maxs,  // Pass in pre-calculated maxs
     float* colScales, int* colZPs,
-    int K, // The number of rows (e.g., seq_len * batch_size)
-    int N) // The number of columns (e.g., hidden_features)
+    int K, // The number of rows
+    int N) // The number of columns
 {
     // Each block processes one column 'n'
     int n = blockIdx.x;
 
     if (n < N) {
-        // --- 1. Get the pre-calculated clipping thresholds for this column ---
-        // For simplicity, we assume one min/max value for the entire tensor,
-        // so we just read from index 0. If you had per-column ranges, you'd use calib_mins[n].
-        float minv = calib_mins[0];
-        float maxv = calib_maxs[0];
+        float minv = calib_mins[n];
+        float maxv = calib_maxs[n];
 
-        // --- 2. Fix the race condition: Only thread 0 calculates the scale/ZP ---
         if (threadIdx.x == 0) {
             float scale = fmaxf((maxv - minv) / 255.f, 1e-8f);
             int zp = static_cast<int>(roundf(-minv / scale));
@@ -113,23 +110,16 @@ __global__ void quantize_activations_colwise(
             colZPs[n] = zp;
         }
 
-        // --- All threads must wait for thread 0 to finish its calculation ---
         __syncthreads();
 
-        // All threads now read the correct, non-racy scale and zero-point
         float scale = colScales[n];
         int zp = colZPs[n];
 
-        // --- 4. Use a robust grid-stride loop ---
-        // This allows a block of, say, 256 threads to process a column of any height (K)
         for (int m = threadIdx.x; m < K; m += blockDim.x) {
             float val = X[m * N + n];
 
-            // --- 3. THE MAGIC: CLAMP the input value to the calibrated range ---
-            // This is the "clipping" that prevents outlier-driven instability.
             val = fmaxf(fminf(val, maxv), minv);
 
-            // The rest of the quantization math remains the same
             float quantized_val = val / scale + zp;
             Xq[m * N + n] = static_cast<uint8_t>(roundf(quantized_val));
         }
@@ -206,10 +196,8 @@ __global__ void qgemm_kernel(const int8_t* __restrict__ Wq,
 
         __syncthreads();
 
-        // Compute only up to K_tile_valid k-steps; but we still iterate TILE_SIZE,
-        // reading shared entries — they were zeroed above for invalid K positions.
+
         for (int k = 0; k < TILE_SIZE; ++k) {
-            // If k >= K_tile_valid then Xq_tile[k][*] and Wq_tile[*][k] are zeros by construction.
             #pragma unroll
             for (int i = 0; i < REG_TILE_M; ++i) {
                 w_reg[i] = Wq_tile[thread_row_in_tile + i][k];
@@ -238,6 +226,22 @@ __global__ void qgemm_kernel(const int8_t* __restrict__ Wq,
                 Y[out_r * N + out_c] = static_cast<float>(acc[i][j]) * Sw[out_r] * Sx[out_c];
             }
         }
+    }
+}
+
+__global__ void dequantize_rowwise_kernel(
+    const int8_t* __restrict__ Wq, 
+    const float* __restrict__ row_scales,
+    float* __restrict__ W_dequant, // The FP32 output tensor
+    int M, int K) 
+{
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+         idx < M * K; 
+         idx += gridDim.x * blockDim.x) {
+        
+        int row = idx / K;
+        
+        W_dequant[idx] = static_cast<float>(Wq[idx]) * row_scales[row];
     }
 }
 
@@ -325,18 +329,16 @@ torch::Tensor quantize_weights_rowwise_wrapper(torch::Tensor A, torch::Tensor ro
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> quantize_activations_colwise_wrapper(
     torch::Tensor X, 
-    torch::Tensor calib_min,  // 1. Accepts the pre-calculated min value
-    torch::Tensor calib_max   // 1. Accepts the pre-calculated max value
+    torch::Tensor calib_min,  // Accepts the pre-calculated min value
+    torch::Tensor calib_max   // Accepts the pre-calculated max value
 ) {
     // --- Input Checks ---
     check_contiguous_cuda(X, "X");
     check_contiguous_cuda(calib_min, "calib_min");
     check_contiguous_cuda(calib_max, "calib_max");
     TORCH_CHECK(X.dim() == 2, "X must be 2D");
-    // TORCH_CHECK(calib_min.numel() == 1, "calib_min should be a single scalar tensor");
-    // TORCH_CHECK(calib_max.numel() == 1, "calib_max should be a single scalar tensor");
 
-    int64_t K = X.size(0); // Renamed M to K for clarity (rows)
+    int64_t K = X.size(0); // rows
     int64_t N = X.size(1); // Columns
 
     // --- Output Tensor Allocation ---
@@ -354,19 +356,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> quantize_activations_col
     dim3 blocks(static_cast<uint32_t>(N));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // 2. The entire on-the-fly colwise_minmax kernel call is now GONE.
-
     // --- Get Data Pointers ---
     const float* X_ptr = X.data_ptr<float>();
     uint8_t* Xq_ptr = Xq.data_ptr<uint8_t>();
     float* scales_ptr = colScales.data_ptr<float>();
     int* zps_ptr = colZPs.data_ptr<int>();
 
-    // 3. Get pointers to the static calibration ranges
     const float* calib_mins_ptr = calib_min.data_ptr<float>();
     const float* calib_maxs_ptr = calib_max.data_ptr<float>();
 
-    // 4. Call the new _clipped kernel with the static calibration ranges
     quantize_activations_colwise<<<blocks, threads, 0, stream>>>(
         X_ptr, Xq_ptr, 
         calib_mins_ptr, calib_maxs_ptr, 
@@ -395,20 +393,16 @@ torch::Tensor qgemm_wrapper(torch::Tensor Wq, torch::Tensor Sw, torch::Tensor Xq
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(Wq.device());
     torch::Tensor Y = torch::zeros({M, N}, options);
 
-    // Use register-tiled kernel configuration
-    // Each thread block handles TILE_SIZE x TILE_SIZE elements
-    // Each thread handles REG_TILE_M x REG_TILE_N elements
+
     const int threads_per_block_x = TILE_SIZE / REG_TILE_N;  // 32/4 = 8
     const int threads_per_block_y = TILE_SIZE / REG_TILE_M;  // 32/4 = 8
     
     dim3 block(threads_per_block_x, threads_per_block_y);  // 8x8 = 64 threads per block
     dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
 
-    // Calculate shared memory size needed for the tiles
     size_t shared_mem_size = TILE_SIZE * TILE_SIZE * sizeof(int8_t) +  // Wq_tile
                             TILE_SIZE * TILE_SIZE * sizeof(int32_t);   // Xq_tile
 
-    // pointers
     const int8_t* Wq_ptr = reinterpret_cast<const int8_t*>(Wq.data_ptr<int8_t>());
     const float* Sw_ptr = Sw.data_ptr<float>();
     const uint8_t* Xq_ptr = Xq.data_ptr<uint8_t>();
@@ -422,6 +416,37 @@ torch::Tensor qgemm_wrapper(torch::Tensor Wq, torch::Tensor Sw, torch::Tensor Xq
     return Y;
 }
 
+torch::Tensor dequantize_rowwise_wrapper(torch::Tensor Wq, torch::Tensor row_scales) {
+    TORCH_CHECK(Wq.is_cuda(), "Wq must be a CUDA tensor");
+    TORCH_CHECK(Wq.is_contiguous(), "Wq must be contiguous");
+    TORCH_CHECK(row_scales.is_cuda(), "row_scales must be a CUDA tensor");
+    TORCH_CHECK(row_scales.is_contiguous(), "row_scales must be contiguous");
+    TORCH_CHECK(Wq.dtype() == torch::kInt8, "Wq must be an INT8 tensor");
+
+    int M = Wq.size(0);
+    int K = Wq.size(1);
+
+    // Create the output tensor in FP32
+    auto options_f = torch::TensorOptions().dtype(torch::kFloat32).device(Wq.device());
+    torch::Tensor W_dequant = torch::empty({M, K}, options_f);
+
+    // Standard CUDA launch configuration
+    const int threads = 256;
+    const int blocks = (M * K + threads - 1) / threads;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Launch the kernel
+    dequantize_rowwise_kernel<<<blocks, threads, 0, stream>>>(
+        Wq.data_ptr<int8_t>(),
+        row_scales.data_ptr<float>(),
+        W_dequant.data_ptr<float>(),
+        M, K
+    );
+    AT_CUDA_CHECK(cudaGetLastError());
+    
+    return W_dequant;
+}
+
 // ------------------- Python binding -------------------
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -432,4 +457,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_weights_rowwise", &quantize_weights_rowwise_wrapper, "Quantize weights rowwise to int8 (CUDA)");
     m.def("quantize_activations_colwise", &quantize_activations_colwise_wrapper, "Quantize activations columnwise -> returns (Xq, colScales, colZPs) (CUDA)");
     m.def("qgemm", &qgemm_wrapper, "Quantized GEMM with register tiling (CUDA). Call as qgemm(Wq, Sw, Xq, Sx, Zx, M, K, N)");
+    m.def("dequantize_rowwise", &dequantize_rowwise_wrapper, "Fast row-wise dequantization from INT8 to FP32");
 }

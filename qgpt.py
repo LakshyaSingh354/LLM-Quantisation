@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoTokenizer, GPT2LMHeadModel
 from datasets import load_dataset
 import math, time
-from qlinear import QuantLinear
+from qlinear import QuantLinear, QuantLinearDequant
 from transformers.pytorch_utils import Conv1D
 
 from tqdm import tqdm
@@ -20,7 +20,6 @@ model.cuda()
 
 layers_to_replace = []
 for name, module in model.named_modules():
-    # ✅ Check for both nn.Linear and the special Conv1D class
     if isinstance(module, (nn.Linear, Conv1D)):
         layers_to_replace.append(name)
 
@@ -29,53 +28,54 @@ print(f"Found {len(layers_to_replace)} linear layers to replace.")
 print("Loading calibration ranges from 'calibration_ranges.pt'...")
 calibration_ranges = torch.load("calibration_ranges.pt")
 
-# --- Step 2: Iterate over the collected names and replace them ---
-for name in layers_to_replace[:2]:
+print("\nStarting hybrid replacement...")
+for i, name in enumerate(layers_to_replace[:2]):
     original_module = model.get_submodule(name)
-    in_features = None
-    # Handle attribute differences between nn.Linear and Conv1D
+    
     if isinstance(original_module, nn.Linear):
         in_features = original_module.in_features
         out_features = original_module.out_features
         original_weight = original_module.weight.data
         original_bias = original_module.bias.data if original_module.bias is not None else None
-        
     elif isinstance(original_module, Conv1D):
-        # The Conv1D weight is stored transposed, so we need to adapt
         in_features = original_module.weight.shape[0]
         out_features = original_module.weight.shape[1]
         original_weight = original_module.weight.data.t()
         original_bias = original_module.bias.data if original_module.bias is not None else None
 
-    layer_calib_range = calibration_ranges[name]
+    if False: # TODO: Remove this
+        layer_calib_range = calibration_ranges[name]
+        new_module = QuantLinear(
+            in_features, out_features,
+            bias=(original_bias is not None),
+            original_weight=original_weight,
+            original_bias=original_bias,
+            calib_min_t=layer_calib_range['min'].to(device),
+            calib_max_t=layer_calib_range['max'].to(device)
+        )
+        print(f"  -> Replacing {name} with FUSED INT8 layer")
+    else:
+        new_module = QuantLinearDequant(
+            in_features, out_features,
+            bias=(original_bias is not None),
+            original_weight=original_weight,
+            original_bias=original_bias
+        )
 
-    # Create your new quantized module
-    new_module = QuantLinear(
-        in_features,
-        out_features,
-        bias=(original_bias is not None),
-        original_weight=original_weight,
-        original_bias=original_bias,
-        calib_min_t=layer_calib_range['min'].to(device),
-        calib_max_t=layer_calib_range['max'].to(device)
-    )
-        
-        # Get the parent module to set the new child
     if '.' in name:
         parent_name, child_name = name.rsplit('.', 1)
         parent_module = model.get_submodule(parent_name)
     else:
         parent_module = model
         child_name = name
-        
     setattr(parent_module, child_name, new_module)
-    print(f"Replaced {name} with QuantLinear")
-    # break
+
+print("\nHybrid replacement complete!")
 
 
 model.eval()
 
-initial_mem = torch.cuda.memory_allocated() / 1024**3 # Convert bytes to GB
+initial_mem = torch.cuda.memory_allocated() / 1024**3
 print(f"Initial model memory usage: {initial_mem:.2f} GB")
 
 # --------------------

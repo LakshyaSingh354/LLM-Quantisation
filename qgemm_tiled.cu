@@ -106,6 +106,8 @@ __global__ void quantize_activations_colwise(const float* __restrict__ X, uint8_
     }
 }
 
+
+
 __global__ void qgemm_kernel(const int8_t* __restrict__ Wq,
                                                  const float* __restrict__ Sw,
                                                  const uint8_t* __restrict__ Xq,
@@ -392,4 +394,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_weights_rowwise", &quantize_weights_rowwise_wrapper, "Quantize weights rowwise to int8 (CUDA)");
     m.def("quantize_activations_colwise", &quantize_activations_colwise_wrapper, "Quantize activations columnwise -> returns (Xq, colScales, colZPs) (CUDA)");
     m.def("qgemm", &qgemm_wrapper, "Quantized GEMM with register tiling (CUDA). Call as qgemm(Wq, Sw, Xq, Sx, Zx, M, K, N)");
+
 }
